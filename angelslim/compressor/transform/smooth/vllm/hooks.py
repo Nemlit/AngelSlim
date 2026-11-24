@@ -204,9 +204,10 @@ def setup_smooth_hooks(
     token_clip=-1,
     profile=None,
     sample_tokens=128,
-    seed=20261016,
+    seed=42,
     num_hidden_layers=None,
     image_embeds_dir=None,
+    stat_names=None,
 ):
     """Register smooth hooks on the model to collect per-channel absmax
     and EMA stats.
@@ -253,7 +254,7 @@ def setup_smooth_hooks(
                     os.environ.pop("VLLM_IMAGE_EMBEDS_DIR", None)
                 else:
                     os.environ["VLLM_IMAGE_EMBEDS_DIR"] = previous
-        return _setup_hy4_hooks(model, sample_tokens, seed, num_hidden_layers)
+        return _setup_hy4_hooks(model, sample_tokens, seed, num_hidden_layers, stat_names)
 
     try:
         from vllm.model_executor.layers.attention import Attention
@@ -654,7 +655,7 @@ def hy4_canonical_name(name):
 class Hy4InputAbsmaxHook:
     """Collect channel absmax and a bounded uniform token sample."""
 
-    def __init__(self, name, stats, samples, sample_tokens, seed=20261016, output=False):
+    def __init__(self, name, stats, samples, sample_tokens, seed=42, output=False):
         if sample_tokens <= 0:
             raise ValueError("Hy4 sample_tokens must be positive")
         self.name, self.stats, self.samples = name, stats, samples
@@ -686,7 +687,7 @@ class Hy4InputAbsmaxHook:
         self.samples[self.name] = rows[keep].contiguous()
 
 
-def _setup_hy4_hooks(model, sample_tokens, seed, num_hidden_layers):
+def _setup_hy4_hooks(model, sample_tokens, seed, num_hidden_layers, stat_names=None):
     if sample_tokens <= 0:
         raise ValueError("Hy4 sample_tokens must be positive")
     remove_smooth_hooks(model, profile="hy4_attention")
@@ -697,13 +698,19 @@ def _setup_hy4_hooks(model, sample_tokens, seed, num_hidden_layers):
             num_hidden_layers is not None and int(name.split(".")[2]) >= num_hidden_layers
         ):
             continue
-        output_hook = name.endswith(".self_attn.kv_a_layernorm")
+        norm_projections = {"kv_a_layernorm": "kv_b_proj", "q_a_layernorm": "q_b_proj"}
+        leaf = name.rsplit(".", 1)[-1]
+        output_hook = leaf in norm_projections
         if name.endswith(".self_attn.fused_qkv_a_proj"):
             name = name.removesuffix("fused_qkv_a_proj") + "q_a_proj"
         elif output_hook:
-            # MLA may bypass KV_b.forward; capture its input at the Norm output.
-            name = name.removesuffix("kv_a_layernorm") + "kv_b_proj"
+            # Capture the normalized input even when a fused kernel bypasses Linear.forward.
+            name = name.removesuffix(leaf) + norm_projections[leaf]
         elif not name.endswith((".self_attn.q_a_proj", ".self_attn.o_proj")):
+            continue
+        if stat_names is not None and name not in stat_names:
+            continue
+        if stat_names is None and name.endswith(".q_b_proj"):
             continue
         if name in candidates:
             raise ValueError(f"duplicate logical Smooth hook: {name}")

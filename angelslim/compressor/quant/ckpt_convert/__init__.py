@@ -13,10 +13,11 @@
 # limitations under the License.
 
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Union
 
 from ....utils.config_parser import default_run_dirs
 
@@ -36,7 +37,7 @@ class ConvertSpec:
     config_groups: dict
     model_name: str = ""  # YAML model.name; selects the legacy fp8_blockwise suffix table
     ignore: List[str] = field(default_factory=list)
-    algorithm: str = "rtn"
+    algorithm: Union[str, List[str]] = "rtn"
     gptq: dict = field(default_factory=dict)
     save_name: str = "compressed-tensors"  # a key of export.SAVE_FORMATS
     split_experts: bool = True
@@ -46,6 +47,7 @@ class ConvertSpec:
     num_workers: int = 8
     skip_unquantized_source: bool = False  # FP8 source: keep its BF16 modules unquantized
     smooth_plan: Optional[str] = None
+    smooth_modules: Optional[Union[str, List[str]]] = None
 
     @property
     def legacy(self):
@@ -54,15 +56,56 @@ class ConvertSpec:
         return get_save_format(self.save_name).legacy
 
 
-def smoothing_options(config):
-    """Return enabled Hy4 Smooth options, or None."""
-    calib = config.compression_config.calibrate
-    options = (calib.args or {}).get("smooth") if calib else None
-    if not options or not options.get("enabled", False):
+def smooth_options(quant, options=None):
+    """Algorithm chains enable Smooth; legacy enabled/profile remains supported."""
+    from .convert import build_groups
+
+    groups = build_groups(quant.get("config_groups"), quant.get("algorithm", "rtn"),
+                          quant.get("gptq")) if quant.get("name") == "mixed" else []
+    chained = any(g.smooth for g in groups)
+    options = dict(options or {})
+    if chained and options.get("enabled") is False:
+        raise ValueError("algorithm includes smooth but smooth.enabled is false")
+    if not options.get("enabled", chained):
         return None
-    if options.get("profile") != "hy4_attention":
+    options.setdefault("profile", "hy4_attention")
+    if options["profile"] != "hy4_attention":
         raise ValueError("Checkpoint Smooth requires profile: hy4_attention")
+    if chained:
+        options.update(config_groups=quant["config_groups"],
+                       algorithm=quant.get("algorithm", "rtn"), gptq=quant.get("gptq"),
+                       ignore=quant.get("ignore_layers", []))
     return options
+
+
+def smoothing_options(config):
+    calib = config.compression_config.calibrate
+    quant = config.compression_config.quantization
+    return smooth_options(vars(quant) if quant else {},
+                          (calib.args or {}).get("smooth") if calib else None)
+
+
+def hessian_modules(spec):
+    """Collect only GPTQ targets, with the collector's fused/runtime names."""
+    from ..modules.gptq.hessian_store import _FUSED
+    from .convert import Layout, Router, build_groups, ckpt_keys, module_name
+
+    router = Router(build_groups(spec.config_groups, spec.algorithm, spec.gptq), spec.ignore)
+    layout, names = Layout(spec.model_path), set()
+    for key in ckpt_keys(spec.model_path):
+        name = module_name(key)
+        group = router.route(name)
+        if group is None or group.algorithm != "gptq":
+            continue
+        runtime = layout.runtime_name(name)
+        parent, _, leaf = runtime.rpartition(".")
+        for candidate in {runtime, parent + "." + _FUSED.get(leaf, leaf)}:
+            candidate = re.sub(r"\.experts\.\d+\.", ".experts.", candidate)
+            names.add(re.escape(candidate))
+            if ".mtp_layers." in name:
+                names.add(re.escape(re.sub(r"^(model\.layers\.\d+\.)", r"\1mtp_block.",
+                                           candidate)))
+    return r"^(?:language_model\.)?(?:" + "|".join(sorted(names)) + r")$" if names else r"(?!)"
 
 
 def run_smoothing(config, config_path):
@@ -125,7 +168,8 @@ def spec_from_config(config):
     from .export import get_save_format
 
     save = get_save_format(quant.save_name)
-    save.check(build_groups(quant.config_groups))
+    save.check(build_groups(quant.config_groups, quant.algorithm, quant.gptq, save.legacy))
+    smooth = smoothing_options(config)
     spec = ConvertSpec(
         model_path=model_path,
         save_path=save_path,
@@ -144,8 +188,9 @@ def spec_from_config(config):
         skip_unquantized_source=quant.skip_unquantized_source,
         smooth_plan=(
             os.path.join(config.global_config.save_path, "smooth", "plan", "smooth_plan.json")
-            if smoothing_options(config) else None
+            if smooth else None
         ),
+        smooth_modules=smooth.get("modules") if smooth else None,
     )
     return spec
 
@@ -181,6 +226,9 @@ def run_calibration(config, config_path):
     # Passed explicitly: the subprocess re-reads the YAML and would otherwise miss dirs
     # derived from a --save-path given on the command line.
     if hessian_dir:
+        smooth = smoothing_options(config)
+        if smooth and "config_groups" in smooth and not (calib.args or {}).get("modules"):
+            cmd += ["--modules", hessian_modules(spec_from_config(config))]
         cmd += ["--hessian-dir", hessian_dir,
                 "--moe-stats-out", os.path.join(stats_dir, "moe_expert_stats.json")]  # fmt: skip
         if (calib.args or {}).get("enable_mtp"):
