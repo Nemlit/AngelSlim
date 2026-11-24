@@ -31,6 +31,8 @@ Combines:
 import json
 import math
 import os
+import re
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
@@ -325,45 +327,94 @@ class TensorReader:
         return tensor
 
 
-def hy4_group_specs(reader):
-    """Trunk gate/O search groups and their compensation graph.
-    BF16 q_a/kv_a/indexer branches share the gate's Norm compensation.
-    """
+HY4_OFFLINE_SMOOTH = {
+    "attn_input": dict(
+        consumers=("q_a_proj", "kv_a_proj_with_mqa", "linear_gate",
+                   "indexer.wk", "indexer.weights_proj"),
+        stat="q_a_proj", norm="input_layernorm",
+    ),
+    "q_input": dict(consumers=("q_b_proj", "indexer.wq_b"),
+                    stat="q_b_proj", norm="self_attn.q_a_layernorm"),
+    "kv_input": dict(consumers=("kv_b_proj",),
+                     stat="kv_b_proj", norm="self_attn.kv_a_layernorm"),
+    "o_input": dict(consumers=("o_proj",), stat="o_proj", producer="kv_b_proj"),
+}
+
+
+def hy4_group_specs(reader, modules=None, config_groups=None, algorithm="rtn", gptq=None,
+                    ignore=()):
+    """Select supported targets; all consumers of their input must be compensated."""
+    from ....quant.ckpt_convert.convert import Router, build_groups, compile_pattern
+
+    if modules is None and config_groups is None:
+        modules = r"^model\.layers\.\d+\.self_attn\.(linear_gate|o_proj)$"
+    patterns = [modules] if isinstance(modules, str) else modules
+    if patterns is not None and (not isinstance(patterns, list)
+                                 or not all(isinstance(p, str) for p in patterns)):
+        raise ValueError("smooth.modules must be a regex or a list of regexes")
+    matchers = [re.compile(p.removeprefix("re:")) for p in patterns or []]
+    router = (Router(build_groups(config_groups, algorithm, gptq), ignore)
+              if config_groups else None)
+    ignored = [compile_pattern(p) for p in ignore]
+    requested = set()
+    for key in reader.weight_map:
+        name = key.removesuffix(".weight")
+        canonical = name.removeprefix("language_model.")
+        group = router.route(canonical) if router else None
+        if any(m(canonical) for m in ignored):
+            continue
+        if router and (group is None or not group.smooth):
+            continue
+        if patterns is not None and not any(m.search(canonical) for m in matchers):
+            continue
+        requested.add(key)
+    supported, specs = set(), []
     for layer in range(int(reader.config["num_hidden_layers"])):
         base = f"{getattr(reader, 'layer_prefix', 'model.layers')}.{layer}"
         attn = f"{base}.self_attn"
         stat_base = f"model.layers.{layer}.self_attn"
-        targets = [f"{attn}.linear_gate.weight"]
-        consumers = [
-            f"{attn}.{name}.weight" for name in ("q_a_proj", "kv_a_proj_with_mqa")
-        ] + [
-            f"{attn}.{name}.weight"
-            for name in ("linear_gate", "indexer.wk", "indexer.weights_proj")
-            if reader.has(f"{attn}.{name}.weight")
-        ]
-        yield dict(
-            name=f"layer{layer}.attn_input",
-            stat=f"{stat_base}.q_a_proj",
-            consumers=consumers,
-            targets=targets,
-            norm=f"{base}.input_layernorm.weight",
-        )
-        yield dict(
-            name=f"layer{layer}.o_input",
-            stat=f"{stat_base}.o_proj",
-            consumers=[f"{attn}.o_proj.weight"],
-            targets=[f"{attn}.o_proj.weight"],
-            producer=f"{attn}.kv_b_proj.weight",
-            producer_stat=f"{stat_base}.kv_b_proj",
-            selector=dict(
-                kind="head_strided_rows",
-                heads=int(reader.config["num_attention_heads"]),
-                head_width=int(reader.config["qk_nope_head_dim"])
-                + int(reader.config["v_head_dim"]),
-                offset=int(reader.config["qk_nope_head_dim"]),
-                length=int(reader.config["v_head_dim"]),
-            ),
-        )
+        for kind, rule in HY4_OFFLINE_SMOOTH.items():
+            consumers = [f"{attn}.{leaf}.weight" for leaf in rule["consumers"]
+                         if reader.has(f"{attn}.{leaf}.weight")]
+            targets = [key for key in consumers if key in requested]
+            if not targets:
+                continue
+            spec = dict(name=f"layer{layer}.{kind}", stat=f"{stat_base}.{rule['stat']}",
+                        consumers=consumers, targets=targets)
+            if "norm" in rule:
+                spec["norm"] = f"{base}.{rule['norm']}.weight"
+                if not reader.has(spec["norm"]):
+                    continue
+            else:
+                spec.update(
+                    producer=f"{attn}.{rule['producer']}.weight",
+                    producer_stat=f"{stat_base}.{rule['producer']}",
+                    selector=dict(kind="head_strided_rows",
+                                  heads=int(reader.config["num_attention_heads"]),
+                                  head_width=int(reader.config["qk_nope_head_dim"])
+                                  + int(reader.config["v_head_dim"]),
+                                  offset=int(reader.config["qk_nope_head_dim"]),
+                                  length=int(reader.config["v_head_dim"])),
+                )
+                if not reader.has(spec["producer"]):
+                    continue
+            supported.update(targets)
+            specs.append(spec)
+    unsupported = requested - supported
+    if unsupported:
+        warnings.warn(f"Offline Smooth skips {len(unsupported)} unsupported targets: "
+                      f"{sorted(unsupported)[:5]}", stacklevel=2)
+    return specs
+
+
+def smooth_selection(options):
+    keys = ("modules", "config_groups", "algorithm", "gptq", "ignore")
+    return {key: options[key] for key in keys if key in options}
+
+
+def _merge_operations(target, operations):
+    for key, ops in operations.items():
+        target.setdefault(key, []).extend(ops)
 
 
 def weight_input_absmax(reader, keys):
@@ -425,7 +476,7 @@ def _validate_hy4_plan(reader, operations, scales):
                 raise ValueError(f"Smooth compensation shape mismatch: {key}")
 
 
-def load_smooth_plan(path):
+def load_smooth_plan(path, selection=None):
     """Load and validate (operations, scales, manifest)."""
     from safetensors import safe_open
 
@@ -433,13 +484,17 @@ def load_smooth_plan(path):
     manifest = json.loads(path.read_text())
     reader = TensorReader(manifest["model_path"])
     expected = {}
-    for spec in hy4_group_specs(reader):
-        expected.update(_hy4_operations(spec))
+    specs = hy4_group_specs(reader, **(selection if selection is not None
+                                     else manifest.get("selection", {})))
+    for spec in specs:
+        _merge_operations(expected, _hy4_operations(spec))
     if (
         manifest.get("profile") != "hy4_attention"
         or manifest.get("scale_policy") != "power_of_two"
         or manifest.get("fp8_scale_dtype") != "float32"
         or manifest["operations"] != expected
+        or {g["name"]: g["targets"] for g in manifest["groups"]}
+        != {s["name"]: s["targets"] for s in specs}
     ):
         raise ValueError("plan differs from the required FP32-FP8 attention compensation graph")
     with safe_open(path.parent / manifest["scale_file"], framework="pt", device="cpu") as handle:
@@ -448,12 +503,12 @@ def load_smooth_plan(path):
     return manifest["operations"], scales, manifest
 
 
-def build_plan(model_path, stats, selected_alpha, lower=1 / 12, upper=2):
+def build_plan(model_path, stats, selected_alpha, lower=1 / 12, upper=2, selection=None):
     """Build (manifest, scales) from selected Smooth alphas."""
     reader = TensorReader(model_path)
     stats = stats.get("stats", stats)
     operations, scales, groups = {}, {}, []
-    for spec in hy4_group_specs(reader):
+    for spec in hy4_group_specs(reader, **(selection or {})):
         name, alpha = spec["name"], float(selected_alpha[spec["name"]])
         act = torch.as_tensor(stats[spec["stat"]]["absmax"], dtype=torch.float32)
         requested = hy4_smooth_scale(
@@ -466,13 +521,14 @@ def build_plan(model_path, stats, selected_alpha, lower=1 / 12, upper=2):
             scales[scale_key] = actual
         else:
             scales[scale_key] = requested
-        operations.update(_hy4_operations(spec))
+        _merge_operations(operations, _hy4_operations(spec))
         groups.append(dict(name=name, alpha=alpha, scale=scale_key, targets=spec["targets"]))
     _validate_hy4_plan(reader, operations, scales)
     return dict(
         model_path=str(reader.root), profile="hy4_attention", scale_policy="power_of_two",
         fp8_scale_dtype="float32", objective="local_fp8_rtn_qdq_without_gptq_hessian",
         scale_file="smooth_scales.safetensors", groups=groups, operations=operations,
+        selection=selection or {},
     ), scales
 
 
@@ -490,7 +546,7 @@ def search_hy4_scales(args):
     stats = raw.get("stats", raw)
     errors, selected = {}, {}
     with safe_open(args.samples, framework="pt", device="cpu") as sample_file:
-        for spec in hy4_group_specs(reader):
+        for spec in hy4_group_specs(reader, **smooth_selection(vars(args))):
             name = spec["name"]
             x = sample_file.get_tensor(spec["stat"]).to(args.device).float()
             act = torch.as_tensor(

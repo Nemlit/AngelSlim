@@ -298,7 +298,12 @@ def parse_args(argv=None):
         if not isinstance(raw, dict):
             raise ValueError("Top level of Smooth YAML must be a mapping")
     runtime = ((raw.get("compression") or {}).get("calibrate") or {}).get("args") or {}
-    profile = args.profile or (runtime.get("smooth") or {}).get("profile") or raw.get("profile")
+    from ....quant.ckpt_convert import smooth_options
+
+    options = smooth_options((raw.get("compression") or {}).get("quantization") or {},
+                             runtime.get("smooth"))
+    profile = (args.profile or (options or runtime.get("smooth") or {}).get("profile")
+               or raw.get("profile"))
     if profile == "hy4_attention":
         args.profile = profile
         explicit = {item.split("=", 1)[0] for item in (sys.argv[1:] if argv is None else argv)}
@@ -690,10 +695,11 @@ def main(argv=None):
 
 def normalize_hy4_config(raw, model_path=None, output_dir=None, **overrides):
     """Resolve Hy4 Smooth options; explicit CLI flags override YAML."""
+    from ....quant.ckpt_convert import smooth_options
     from ....quant.vllm_calib.llm import flatten_angelslim_yaml
 
     config = dict(
-        profile="hy4_attention", num_samples=128, seed=20261016, sample_offset=0,
+        profile="hy4_attention", num_samples=128, seed=42, sample_offset=0,
         max_length=16384, sample_tokens=128,
         alphas=[0, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1], smooth_min=1 / 12, smooth_max=2,
         minimum_gain=0.001, device="cuda:0", tp_size=32, max_num_seqs=4,
@@ -718,7 +724,8 @@ def normalize_hy4_config(raw, model_path=None, output_dir=None, **overrides):
         config["model_path"] = (raw.get("model") or {}).get("model_path")
         config["run_root"] = (raw.get("global") or {}).get("save_path")
         # Smooth sample count is independent of dataset.num_samples.
-        config.update(flat.get("smooth") or {})
+        quant = (raw.get("compression") or {}).get("quantization") or {}
+        config.update(smooth_options(quant, flat.get("smooth")) or flat.get("smooth") or {})
     else:
         config.update(raw)
         for key, alias in (("ptq_data_path", "data_path"), ("batch_size", "max_num_seqs"),
@@ -762,9 +769,26 @@ def collect_hy4_stats(config):
         hf_config,
         load_records,
     )
-    from ..core.stats_search import TensorReader, hy4_group_specs, save_smooth_stats
+    from ..core.stats_search import (
+        TensorReader,
+        hy4_group_specs,
+        save_smooth_stats,
+        smooth_selection,
+    )
 
     reader = TensorReader(config["model_path"])
+    specs = hy4_group_specs(reader, **smooth_selection(config))
+    expected = {spec[key] for spec in specs
+                for key in ("stat", "producer_stat") if key in spec}
+    root = Path(config["run_root"]) / "smooth"
+    root.mkdir(parents=True, exist_ok=True)
+    if not specs:
+        from safetensors.torch import save_file
+
+        print("[hy4 smooth] no supported targets; skipping collection", flush=True)
+        save_smooth_stats(dict(stats={}), root / "stats.json")
+        save_file({}, str(root / "samples.safetensors"))
+        return str(root / "stats.json")
     records = load_records(config["data_path"], 0)
     random.Random(config["seed"]).shuffle(records)
     offset, count = config["sample_offset"], config["num_samples"]
@@ -782,8 +806,6 @@ def collect_hy4_stats(config):
     if len(prompts) != count:
         raise RuntimeError(f"Smooth requires all {count} selected records; built {len(prompts)}")
     print(f"[hy4 smooth] {count} prompts, {n_mm} multimodal, seed={config['seed']}", flush=True)
-    root = Path(config["run_root"]) / "smooth"
-    root.mkdir(parents=True, exist_ok=True)
     previous_cache = os.environ.get("VLLM_IMAGE_EMBEDS_DIR")
     llm = None
     hooks_started = False
@@ -815,14 +837,11 @@ def collect_hy4_stats(config):
             )
         llm = LLM(**kwargs)
         llm.llm_engine.collective_rpc(worker_bootstrap())
-        expected = {
-            spec[key] for spec in hy4_group_specs(reader)
-            for key in ("stat", "producer_stat") if key in spec
-        }
         hooks_started = True
         setup = llm.apply_model(partial(
             setup_smooth_hooks, profile="hy4_attention", sample_tokens=config["sample_tokens"],
             seed=config["seed"], num_hidden_layers=int(reader.config["num_hidden_layers"]),
+            stat_names=sorted(expected),
             image_embeds_dir=config.get("image_embeds_dir") or previous_cache,
         ))
         if len(setup) != config["tp_size"] or any(set(s["names"]) != expected for s in setup):
@@ -862,7 +881,12 @@ def search_hy4_plan(config):
     """Search scales and save the compensation plan."""
     from safetensors.torch import save_file
 
-    from ..core.stats_search import build_plan, save_smooth_stats, search_hy4_scales
+    from ..core.stats_search import (
+        build_plan,
+        save_smooth_stats,
+        search_hy4_scales,
+        smooth_selection,
+    )
 
     root = Path(config["run_root"]) / "smooth"
     report = search_hy4_scales(SimpleNamespace(**{
@@ -872,6 +896,7 @@ def search_hy4_plan(config):
     plan, scales = build_plan(
         config["model_path"], json.loads((root / "stats.json").read_text())["stats"],
         report["selected_alpha"], config["smooth_min"], config["smooth_max"],
+        selection=smooth_selection(config),
     )
     (root / "plan").mkdir(parents=True, exist_ok=True)
     save_file(scales, str(root / "plan" / plan["scale_file"]))
