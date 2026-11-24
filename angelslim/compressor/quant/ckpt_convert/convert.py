@@ -380,6 +380,13 @@ class Converter:
         self.mtp_keys = set()
         if spec.mtp_file:
             self.mtp_keys = set(self._open(spec.mtp_file).keys())
+        self.smooth_ops, self.smooth_scales = {}, {}
+        if spec.smooth_plan:
+            from ...transform.smooth.core.stats_search import load_smooth_plan
+
+            self.smooth_ops, self.smooth_scales, manifest = load_smooth_plan(spec.smooth_plan)
+            if os.path.realpath(manifest["model_path"]) != os.path.realpath(spec.model_path):
+                raise ValueError("Smooth plan belongs to a different BF16 checkpoint")
 
     def _open(self, path):
         if path not in self._files:
@@ -411,6 +418,10 @@ class Converter:
         scale_key = key + "_scale_inv"
         if tensor.dtype == torch.float8_e4m3fn and self.layout.fp8_block and self._has(scale_key):
             tensor = dequant_fp8_block(tensor, self._raw(scale_key), self.layout.fp8_block)
+        if key in self.smooth_ops:
+            from ...transform.smooth.core.tensor_math import apply_smooth_operations
+
+            tensor = apply_smooth_operations(key, tensor, self.smooth_ops, self.smooth_scales)
         return tensor
 
     def convert_shard(self, file_name):

@@ -45,12 +45,37 @@ class ConvertSpec:
     mtp_file: Optional[str] = None
     num_workers: int = 8
     skip_unquantized_source: bool = False  # FP8 source: keep its BF16 modules unquantized
+    smooth_plan: Optional[str] = None
 
     @property
     def legacy(self):
         from .export import get_save_format
 
         return get_save_format(self.save_name).legacy
+
+
+def smoothing_options(config):
+    """Return enabled Hy4 Smooth options, or None."""
+    calib = config.compression_config.calibrate
+    options = (calib.args or {}).get("smooth") if calib else None
+    if not options or not options.get("enabled", False):
+        return None
+    if options.get("profile") != "hy4_attention":
+        raise ValueError("Checkpoint Smooth requires profile: hy4_attention")
+    return options
+
+
+def run_smoothing(config, config_path):
+    if not smoothing_options(config):
+        return
+    repo = os.path.abspath(os.path.join(os.path.dirname(__file__), *[".."] * 4))
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join([repo, os.environ.get("PYTHONPATH", "")])}
+    subprocess.run([
+        sys.executable, "-m", "angelslim.compressor.transform.smooth.vllm.collect",
+        "--profile", "hy4_attention", "-c", config_path,
+        "--model-path", config.model_config.model_path,
+        "--output-dir", config.global_config.save_path,
+    ], check=True, env=env)
 
 
 def fp8_blockwise_spec(model_path, save_path, block_size=(128, 128), num_workers=8, ignore=(),
@@ -117,6 +142,10 @@ def spec_from_config(config):
         mtp_file=quant.mtp_file,
         num_workers=quant.num_workers,
         skip_unquantized_source=quant.skip_unquantized_source,
+        smooth_plan=(
+            os.path.join(config.global_config.save_path, "smooth", "plan", "smooth_plan.json")
+            if smoothing_options(config) else None
+        ),
     )
     return spec
 
@@ -140,12 +169,14 @@ def run_calibration(config, config_path):
         outputs.append(os.path.join(stats_dir, "mtp_moe_expert_stats.json"))
     if all(os.path.isfile(p) for p in outputs):
         print(f"calib stage: reusing {', '.join(outputs)}")
+        run_smoothing(config, config_path)
         return
     if not config.dataset_config or not config.dataset_config.data_path:
         raise ValueError("calib stage needs dataset.data_path")
     module = "hessian_collect" if hessian_dir else "calibrate"
     cmd = [sys.executable, "-m", f"angelslim.compressor.quant.vllm_calib.{module}",
-           "-c", config_path, "--model-path", config.model_config.model_path,
+           "-c", config_path, "--model-path",
+           (calib.args or {}).get("model_path") or config.model_config.model_path,
            "--image-embeds-dir", embeds]  # fmt: skip
     # Passed explicitly: the subprocess re-reads the YAML and would otherwise miss dirs
     # derived from a --save-path given on the command line.
@@ -164,6 +195,7 @@ def run_calibration(config, config_path):
     missing = [p for p in outputs if not os.path.isfile(p)]
     if missing:
         raise RuntimeError(f"calibration finished without {missing}")
+    run_smoothing(config, config_path)
 
 
 def convert_checkpoint(spec, stage="all", node_rank=0, num_nodes=1, skip_existing=False):
